@@ -78,9 +78,76 @@ const envAdmins = new Set(String(process.env.ADMIN_IDS || "").split(",").map((s)
 const isAdminId = (id) => String(id) === S.uid || envAdmins.has(String(id)) || (cfg.admins || []).map(String).includes(String(id));
 
 // ---------- reply pools (replies.json: array OR { type: [..], default: [..] }) ----------
-const RAW_POOL = JSON.parse(fs.readFileSync(path.join(__dirname, "replies.json"), "utf8"));
+// Self-healing loader: a broken replies.json (trailing comma, truncated upload, stray text at the end)
+// must NEVER crash the server. We try: strict parse -> strip trailing commas -> cut back to the last
+// valid point and close the brackets -> built-in fallback pool.
+const FALLBACK_REPLIES = ["haha", "oo nga", "talaga ba?", "grabe", "sige lang", "okay", "hmm", "ay", "edi wow", "ganun?"];
+
+function tryParse(s) { try { return JSON.parse(s); } catch { return undefined; } }
+
+function repairJson(text) {
+  let t = String(text).replace(/^\uFEFF/, "").trim();
+  let v = tryParse(t);
+  if (v !== undefined) return { value: v, how: null };
+
+  const noTrailing = (s) => s.replace(/,(\s*[}\]])/g, "$1");
+  v = tryParse(noTrailing(t));
+  if (v !== undefined) return { value: v, how: "trailing commas removed" };
+
+  // Scan once; remember every point right after a closed string/value, together with the
+  // brackets that were still open there. Then try cutting from the latest point backwards.
+  const cuts = [];
+  const stack = [];
+  let inStr = false, esc = false;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') { inStr = false; cuts.push([i + 1, stack.slice()]); }
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") stack.push("}");
+    else if (c === "[") stack.push("]");
+    else if (c === "}" || c === "]") { stack.pop(); cuts.push([i + 1, stack.slice()]); }
+  }
+  for (let n = cuts.length - 1, tries = 0; n >= 0 && tries < 400; n--, tries++) {
+    const [pos, open] = cuts[n];
+    const head = noTrailing(t.slice(0, pos).replace(/[,\s:]+$/, ""));
+    const cand = head + open.slice().reverse().join("");
+    const r = tryParse(cand);
+    if (r !== undefined) return { value: r, how: `cut at char ${pos} and closed ${open.length} bracket(s)` };
+  }
+  return { value: undefined, how: "unrecoverable" };
+}
+
+function loadPools() {
+  const file = path.join(__dirname, "replies.json");
+  let raw = null;
+  try { raw = fs.readFileSync(file, "utf8"); }
+  catch (e) { console.error("[replies] cannot read replies.json: " + e.message + " — using fallback pool"); }
+  if (raw != null) {
+    const { value, how } = repairJson(raw);
+    if (value !== undefined && (Array.isArray(value) || (value && typeof value === "object"))) {
+      if (how) {
+        console.error(`[replies] replies.json is invalid JSON — auto-repaired (${how}). Please fix the file in the repo.`);
+        try { fs.writeFileSync(path.join(DATA, "replies.repaired.json"), JSON.stringify(value, null, 2)); } catch {}
+      }
+      return value;
+    }
+    console.error("[replies] replies.json is invalid and could not be repaired — using fallback pool");
+  }
+  return { default: FALLBACK_REPLIES };
+}
+
+const RAW_POOL = loadPools();
 const POOLS = Array.isArray(RAW_POOL) ? { default: RAW_POOL } : RAW_POOL;
-const ALL_REPLIES = [...new Set(Object.values(POOLS).flat())];
+for (const k of Object.keys(POOLS)) {               // keep only string entries, drop junk
+  POOLS[k] = Array.isArray(POOLS[k]) ? POOLS[k].filter((x) => typeof x === "string" && x) : [];
+}
+let ALL_REPLIES = [...new Set(Object.values(POOLS).flat())];
+if (!ALL_REPLIES.length) { ALL_REPLIES = FALLBACK_REPLIES.slice(); POOLS.default = ALL_REPLIES; }
 const poolKey = (type) => (Array.isArray(POOLS[type]) && POOLS[type].length ? type : "default");
 const poolFor = (type) => (Array.isArray(POOLS[poolKey(type)]) && POOLS[poolKey(type)].length ? POOLS[poolKey(type)] : ALL_REPLIES);
 
@@ -171,6 +238,9 @@ function stopListening() {
   } catch {}
 }
 function teardown() { stopListening(); stopAllTyping(); S.api = null; S.online = false; S.busy.clear(); }
+
+// Net watchdog state (declared up here so every function below can use it safely).
+let netUp = true, netDownAt = 0, netMiss = 0;
 
 // Auth problems pause the fast retry loop (so the account isn't hammered) but we still
 // try again every 30 min: "expired" errors are sometimes temporary, and the bot should
@@ -291,7 +361,6 @@ setInterval(() => {
 // Net watchdog: a dead network usually gives NO error on the MQTT socket, so without this the bot
 // can sit "connected" but deaf for up to 40 min. Probe every 30s; when the net comes back after an
 // outage, force a fresh listen (or an immediate reconnect) so auto-reply resumes within seconds.
-let netUp = true, netDownAt = 0, netMiss = 0;
 async function probeNet() {
   const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 8000);
   try { await fetch("https://www.facebook.com/favicon.ico", { method: "HEAD", signal: ctl.signal }); return true; } // any HTTP answer = net is up
@@ -423,7 +492,9 @@ async function onEvent(ev) {
     const text = typeof r === "string" && r ? r : ALL_REPLIES[Math.floor(Math.random() * ALL_REPLIES.length)];
 
     const now = Date.now();
-    S.replies.push(now); S.daily.push(now); S.senders.set(ev.senderID, now); S.threads.get(ev.threadID).push(now);
+    S.replies.push(now); S.daily.push(now); S.senders.set(ev.senderID, now);
+    if (!S.threads.has(ev.threadID)) S.threads.set(ev.threadID, []);
+    S.threads.get(ev.threadID).push(now);
 
     if (cfg.markRead && typeof api.markAsRead === "function") {   // "seen" shortly after it arrives, like a person
       setTimeout(() => { try { api.markAsRead(ev.threadID, true, () => {}); } catch {} }, rnd(250, 1200));
@@ -564,7 +635,7 @@ app.get("/api/threads", (q, r) => {
 });
 
 // A long-running process must not die on one stray exception, and must save the
-// freshest cookie when the host (Railway) sends SIGTERM on redeploy.
+// freshest cookie when the host (Railway/Render) sends SIGTERM on redeploy.
 process.on("uncaughtException", (e) => log("fatal", (e && e.stack) || e));
 process.on("unhandledRejection", (e) => log("fatal", (e && e.stack) || e));
 for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { economy.flush(); stopAllTyping(); captureState("shutdown"); save(); process.exit(0); });
