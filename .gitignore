@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Secrets (huwag i-push)
+.env
+.env.*
+appstate.json
+appstate*.json
+fbstate.json
+cookies.json
+*.pem
+*.key
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Misc
+tmp/
+temp/
+coverage/
+dist/
